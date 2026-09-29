@@ -90,7 +90,8 @@ class CLITests(unittest.TestCase):
         proc = subprocess.Popen([sys.executable, "-m", "ai_watch", "--demo"],
                                 stdin=slave, stdout=slave, stderr=slave,
                                 env=dict(os.environ, TERM="xterm"))
-        os.close(slave)
+        # Keep a slave descriptor open while draining: macOS can discard unread
+        # output when the child closes the last slave descriptor on exit.
         data = b""
         try:
             deadline = time.monotonic() + 5
@@ -100,22 +101,20 @@ class CLITests(unittest.TestCase):
                     data += os.read(master, 65536)
             self.assertIn(b"Ctrl+C", data)
             proc.send_signal(signal.SIGINT)
+            deadline = time.monotonic() + 5
+            restored = b"\x1b[?25h\x1b[?1049l"
+            while restored not in data and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.1)[0]:
+                    data += os.read(master, 65536)
             proc.wait(timeout=5)
-            while select.select([master], [], [], 0.1)[0]:
-                try:
-                    chunk = os.read(master, 65536)
-                    if not chunk:
-                        break
-                    data += chunk
-                except OSError:
-                    break
             self.assertEqual(proc.returncode, 130)
-            self.assertIn(b"\x1b[?25h\x1b[?1049l", data)
+            self.assertIn(restored, data)
         finally:
             if proc.poll() is None:
                 proc.kill()
             proc.wait()
             os.close(master)
+            os.close(slave)
 
 
 if __name__ == "__main__":

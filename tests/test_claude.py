@@ -85,7 +85,7 @@ class ClaudeCredentialTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.profile = Profile("claude", "work", self.root / "work")
         self.profile.home.mkdir()
 
@@ -125,7 +125,7 @@ class ClaudeCacheTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.profile = Profile("claude", "test", self.root / "profile")
         self.auth = {"accessToken": "fake-test-token-never-real"}
         self.cache = self.root / "cache"
