@@ -10,22 +10,21 @@ and which account still has room. Monitor one account or several, with a live
 dashboard or a single snapshot.
 
 ```text
-CODEX
-  personal  alex@example.com  (pro)
-    █████░░░░░░░░░  34.0%  5h window
-    █████████░░░░░  62.0%  7d window
-  work  alex@example.org  (team)
-    ███████████░░░  78.0%  5h window
+CODEX  live quota via account/rateLimits/read
+  personal   alex@example.com                 pro   █████░░░░░░░░░  34.0%  5h window
+                                                    █████████░░░░░  62.0%  7d window
+                                                    credits: none
+  work       alex@example.org                 team  ███████████░░░  78.0%  5h window
+                                                    ██████░░░░░░░░  45.0%  7d window
 
-CLAUDE
-  personal  alex@example.com  (max)
-    ███░░░░░░░░░░░  23.0%  session
-    █████████████░  91.0%  week (all models)
-    ███░░░░░░░░░░░  18.0%  week (Sonnet)
+CLAUDE  live quota via usage API (cached up to 2m)
+  personal   alex@example.com                 max   ███░░░░░░░░░░░  23.0%  session
+                                                    █████████████░  91.0%  week (all models)
+                                                    ███░░░░░░░░░░░  18.0%  week (Sonnet)
 ```
 
 Abbreviated synthetic example. The dashboard also shows reset dates, countdowns,
-credits when available, and cache or error status.
+credits when available, and stale-data or error status.
 
 - Codex and Claude Code, with named profiles for multiple accounts.
 - Live provider quotas, including weekly and model-specific windows.
@@ -209,7 +208,7 @@ responses. Profile names remain visible with `--hide-email`.
 | Claude HTTP 429 | Let the displayed retry delay expire; frequent restarts will not bypass it. |
 | Claude Keychain lookup fails | Unlock your Keychain and check the profile's `keychain_service`. |
 | Cache cannot be accessed | Make sure `XDG_CACHE_HOME` points to a directory you can write. |
-| Quotas look unchanged | Claude caches successful reads for two minutes; look for the cache age. |
+| Quotas look unchanged | Claude caches successful reads for two minutes; wait for the next fetch. |
 
 Native Windows monitoring is not supported in this version; use WSL. macOS
 Keychain access requires a local user session with access to the saved login.

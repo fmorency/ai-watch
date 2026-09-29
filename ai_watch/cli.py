@@ -119,8 +119,6 @@ def run(argv=None, *, watch=True):
                 if alternate:
                     print("\033[H\033[2J", end="")
                 print(render(report, color=color, ascii_only=args.ascii), flush=True)
-                if alternate:
-                    print(f"\nRefresh every {args.interval:g}s · Ctrl+C to quit", flush=True)
             if once or not accounts:
                 return 1 if not accounts or any(a.get("error") for a in accounts) else 0
             time.sleep(max(1, args.interval - (time.monotonic() - started)))

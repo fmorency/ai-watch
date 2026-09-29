@@ -27,18 +27,36 @@ def when(timestamp, now):
 def render(report, *, color=False, ascii_only=False):
     reset, bold, dim = ("\033[0m", "\033[1m", "\033[2m") if color else ("", "", "")
     now = report["generated_at"]
-    stamp = datetime.fromtimestamp(now).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    suffix = "  DEMO — synthetic data" if report.get("demo") else ""
-    lines = [f"{bold}ai-watch{reset}  {dim}{stamp}{reset}{suffix}"]
+    all_accounts = report["accounts"]
+    name_width = max([10] + [len(safe_text(a["name"])) for a in all_accounts])
+    plan_width = max([5] + [len(safe_text(a.get("plan") or "?")) for a in all_accounts])
+    show_email = any(a.get("email") for a in all_accounts)
+    email_width = max([32] + [len(safe_text(a.get("email") or "")) for a in all_accounts])
+    separator = " | " if ascii_only else " · "
+
+    def account_prefix(account):
+        fields = [f"{safe_text(account['name']):<{name_width}}"]
+        if show_email:
+            fields.append(f"{safe_text(account.get('email') or ''):<{email_width}}")
+        fields.append(f"{safe_text(account.get('plan') or '?'):<{plan_width}}")
+        return "  " + " ".join(fields) + " "
+
+    lines = [f"{dim}ai-watch DEMO - synthetic data{reset}"] if report.get("demo") else []
+    captions = {
+        "codex": "live quota via account/rateLimits/read",
+        "claude": "live quota via usage API (cached up to 2m)",
+    }
     for provider in ("codex", "claude"):
-        accounts = [a for a in report["accounts"] if a["provider"] == provider]
+        accounts = [a for a in all_accounts if a["provider"] == provider]
         if not accounts:
             continue
-        lines.extend(["", f"{bold}{provider.upper()}{reset}"])
+        if lines:
+            lines.append("")
+        lines.append(f"{bold}{provider.upper()}{reset}  {dim}{captions[provider]}{reset}")
         for account in accounts:
-            email = f"  {safe_text(account['email'])}" if account.get("email") else ""
-            plan = f"  ({safe_text(account['plan'])})" if account.get("plan") else ""
-            lines.append(f"  {bold}{safe_text(account['name'])}{reset}{email}{dim}{plan}{reset}")
+            head = account_prefix(account)
+            pad = " " * len(head)
+            details = []
             for quota in account.get("windows", []):
                 percent = quota["used_percent"]
                 filled = round(min(percent, 100) * 14 / 100)
@@ -46,27 +64,28 @@ def render(report, *, color=False, ascii_only=False):
                 bar = on * filled + off * (14 - filled)
                 tint = ("\033[31m" if percent >= 90 else "\033[33m" if percent >= 70 else "\033[32m") if color else ""
                 label = safe_text(quota["name"])
-                line = f"    {tint}{bar} {percent:5.1f}%{reset}  {label}"
+                line = f"{tint}{bar}{reset} {tint}{percent:5.1f}%{reset}  {label}"
                 if quota.get("resets_at") is not None:
-                    line += f"  {dim}resets {when(quota['resets_at'], now)}{reset}"
-                lines.append(line)
-            for note in account.get("notes", []):
-                lines.append(f"    {dim}{safe_text(note)}{reset}")
+                    line += f"{dim}{separator}resets {when(quota['resets_at'], now)}{reset}"
+                details.append(line)
+            if account.get("notes"):
+                notes = separator.join(safe_text(note) for note in account["notes"])
+                details.append(f"{dim}{notes}{reset}")
             error = account.get("error")
+            retry = f"{separator}retry {when(account['retry_at'], now)}" if account.get("retry_at") else ""
             if error:
                 if account.get("windows"):
                     age = max(0, int((now - account["fetched_at"]) / 60))
                     prefix = f"STALE ({age}m old)"
                 else:
                     prefix = "unavailable"
-                lines.append(f"    {prefix}: {safe_text(error)}")
-            elif account.get("cached") and account.get("windows"):
-                age = max(0, int(now - account["fetched_at"]))
-                lines.append(f"    {dim}cached {age}s ago{reset}")
-            if account.get("retry_at"):
-                lines.append(f"    {dim}retry {when(account['retry_at'], now)}{reset}")
-    if not report["accounts"]:
-        lines.extend(["", "No profiles found. Sign in to Codex or Claude Code, or use --config.",
+                details.append(f"{dim}{prefix}: {safe_text(error)}{retry}{reset}")
+            elif retry:
+                details.append(f"{dim}{retry[len(separator):]}{reset}")
+            for index, detail in enumerate(details or ["unavailable: no quota data"]):
+                lines.append((head if index == 0 else pad) + detail)
+    if not all_accounts:
+        lines.extend(["No profiles found. Sign in to Codex or Claude Code, or use --config.",
                       "See examples/config.json for multiple accounts."])
     text = "\n".join(lines)
     return text.encode("ascii", errors="replace").decode() if ascii_only else text

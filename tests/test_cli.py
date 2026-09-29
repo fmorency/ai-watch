@@ -95,11 +95,12 @@ class CLITests(unittest.TestCase):
         data = b""
         try:
             deadline = time.monotonic() + 5
-            while b"Ctrl+C" not in data and time.monotonic() < deadline:
+            ready_marker = b"week (Sonnet)"
+            while ready_marker not in data and time.monotonic() < deadline:
                 ready, _, _ = select.select([master], [], [], 0.2)
                 if ready:
                     data += os.read(master, 65536)
-            self.assertIn(b"Ctrl+C", data)
+            self.assertIn(ready_marker, data)
             proc.send_signal(signal.SIGINT)
             deadline = time.monotonic() + 5
             restored = b"\x1b[?25h\x1b[?1049l"
