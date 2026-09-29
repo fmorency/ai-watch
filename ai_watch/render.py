@@ -43,7 +43,7 @@ def render(report, *, color=False, ascii_only=False):
 
     lines = [f"{dim}ai-watch DEMO - synthetic data{reset}"] if report.get("demo") else []
     captions = {
-        "codex": "live quota via account/rateLimits/read",
+        "codex": "live quota via usage API (cached up to 1m)",
         "claude": "live quota via usage API (cached up to 2m)",
     }
     for provider in ("codex", "claude"):
@@ -74,7 +74,7 @@ def render(report, *, color=False, ascii_only=False):
             error = account.get("error")
             retry = f"{separator}retry {when(account['retry_at'], now)}" if account.get("retry_at") else ""
             if error:
-                if account.get("windows"):
+                if account.get("windows") or account.get("notes"):
                     age = max(0, int((now - account["fetched_at"]) / 60))
                     prefix = f"STALE ({age}m old)"
                 else:

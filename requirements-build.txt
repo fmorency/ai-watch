@@ -1,0 +1,4 @@
+# Only needed to create standalone release executables.
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.7
+certifi==2026.7.22

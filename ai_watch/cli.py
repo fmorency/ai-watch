@@ -40,7 +40,7 @@ def parser(watch):
     result.add_argument("--profile", action="append", default=[], metavar="NAME",
                         help="select a name or provider:name; repeat for multiple profiles")
     result.add_argument("--timeout", type=positive_seconds, default=20, metavar="SECONDS",
-                        help="Codex probe deadline / Claude network timeout (default: 20)")
+                        help="provider network timeout in seconds (default: 20)")
     result.add_argument("--json", action="store_true", help="print one JSON snapshot and exit")
     result.add_argument("--hide-email", action="store_true", help="omit email addresses from text and JSON")
     result.add_argument("--ascii", action="store_true", help="use ASCII output and progress bars")
@@ -70,7 +70,7 @@ def collect(profiles, timeout):
                     results[profile] = job.result()
                 except Exception:
                     # Third-party data and OS exceptions can contain secrets; never echo them.
-                    results[profile] = {"error": "usage probe failed; check login and provider CLI version"}
+                    results[profile] = {"error": "usage check failed; check login and update ai-watch"}
         except BaseException:
             cancel.set()
             for job in jobs:

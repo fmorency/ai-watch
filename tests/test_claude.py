@@ -1,3 +1,4 @@
+import fcntl
 import io
 import json
 import os
@@ -191,7 +192,7 @@ class ClaudeCacheTests(unittest.TestCase):
         self.cache.mkdir()
         path = self.cache / claude.cache_key(self.profile, self.auth)
         with path.open("w") as lock:
-            claude.fcntl.flock(lock, claude.fcntl.LOCK_EX)
+            fcntl.flock(lock, fcntl.LOCK_EX)
             started = time.monotonic()
             with self.assertRaisesRegex(UsageError, "cache lock"):
                 self.read(timeout=0.1)

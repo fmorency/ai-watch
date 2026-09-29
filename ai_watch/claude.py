@@ -1,33 +1,21 @@
 """Read Claude subscription quotas; keep a private, token-free quota cache."""
 
-import fcntl
-import hashlib
 import json
-import os
-import stat
 import subprocess
 import sys
 import time
 from datetime import datetime
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import Request, build_opener
 
-from . import __version__
-from .common import UsageError, number, optional_text, read_object, window
-from .config import cache_path
+from . import __version__, cache
+from .common import UsageError, optional_text, read_object, window
+from .http import MAX_RESPONSE, NoRedirect, retry_time
+from .runtime import external_command_env
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CACHE_TTL = 120
-STALE_TTL = 3600
-MAX_RESPONSE = 1024 * 1024
-
-
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        # Never forward an OAuth bearer token to a redirect target.
-        return None
 
 
 def credentials(profile, timeout):
@@ -46,7 +34,7 @@ def credentials(profile, timeout):
             result = subprocess.run(
                 ["security", "find-generic-password", "-s", service, "-w"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                timeout=min(timeout, 5), check=True,
+                timeout=min(timeout, 5), check=True, env=external_command_env(),
             )
             data = json.loads(result.stdout)
         except (OSError, subprocess.SubprocessError, ValueError):
@@ -133,21 +121,6 @@ def parse_limits(data):
     return {"windows": windows}
 
 
-def retry_time(value, now):
-    minimum = now + 60
-    try:
-        seconds = float(value)
-        if number(seconds):
-            return max(minimum, now + seconds)
-    except (TypeError, ValueError, OverflowError):
-        pass
-    try:
-        stamp = parsedate_to_datetime(value).timestamp()
-        return max(minimum, stamp) if number(stamp) else minimum
-    except (TypeError, ValueError, OverflowError, IndexError):
-        return minimum
-
-
 def fetch_usage(auth, timeout):
     request = Request(USAGE_URL, headers={
         "Authorization": f"Bearer {auth['accessToken']}",
@@ -181,79 +154,12 @@ def fetch_usage(auth, timeout):
 
 
 def cache_key(profile, auth):
-    # Token rotation may miss the cache once; it can never reuse another login's data.
-    key = f"{profile.home.resolve()}\0{auth['accessToken']}".encode()
-    return "claude-" + hashlib.sha256(key).hexdigest() + ".json"
-
-
-def read_state(stream):
-    try:
-        state = json.load(stream)
-        if not isinstance(state, dict) or not number(state.get("next_fetch_at")):
-            return {}
-        result = state.get("result")
-        if not isinstance(result, dict):
-            return {}
-        if set(result) - {"windows", "fetched_at", "error", "retry_at", "cached"}:
-            return {}
-        if not result.get("windows") and not result.get("error"):
-            return {}
-        if result.get("windows"):
-            if not isinstance(result["windows"], list) or not number(result.get("fetched_at")):
-                return {}
-            for item in result["windows"]:
-                if not isinstance(item, dict) or not isinstance(item.get("name"), str):
-                    return {}
-                window(item["name"], item.get("used_percent"), item.get("resets_at"))
-        if "error" in result and (not isinstance(result["error"], str) or not result["error"]):
-            return {}
-        if "retry_at" in result and not number(result["retry_at"]):
-            return {}
-        return state
-    except (ValueError, UsageError):
-        return {}
+    return cache.key(profile, auth["accessToken"])
 
 
 def cached_usage(profile, auth, timeout, cache_dir=None, cancel=None):
-    directory = Path(cache_dir) if cache_dir is not None else cache_path()
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(directory / cache_key(profile, auth), flags, 0o600)
-    with os.fdopen(fd, "r+", encoding="utf-8") as stream:
-        metadata = os.fstat(stream.fileno())
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
-            raise UsageError("usage cache must be a regular file owned by you")
-        os.fchmod(stream.fileno(), 0o600)
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline or (cancel is not None and cancel.is_set()):
-                    raise UsageError("another usage check holds this profile's cache lock; try again")
-                time.sleep(0.05)
-        state = read_state(stream)
-        now = time.time()
-        previous = state.get("result", {})
-        if now - previous.get("fetched_at", 0) > STALE_TTL:
-            previous.pop("windows", None)
-        if now < state.get("next_fetch_at", 0):
-            return dict(previous, cached=True)
-        result = fetch_usage(auth, timeout)
-        now = time.time()
-        if result.get("windows"):
-            result["fetched_at"] = now
-            next_fetch = now + CACHE_TTL
-        else:
-            next_fetch = max(now + 60, result.get("retry_at", 0))
-            result["retry_at"] = next_fetch
-            if previous.get("windows") and now - previous.get("fetched_at", 0) <= STALE_TTL:
-                result.update(windows=previous["windows"], fetched_at=previous["fetched_at"], cached=True)
-        stream.seek(0)
-        json.dump({"result": result, "next_fetch_at": next_fetch}, stream, allow_nan=False)
-        stream.truncate()
-        return result
+    return cache.read_or_fetch(cache_key(profile, auth), lambda: fetch_usage(auth, timeout),
+                               timeout, CACHE_TTL, cache_dir, cancel)
 
 
 def fetch(profile, timeout=20, cancel=None):

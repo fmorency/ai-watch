@@ -10,7 +10,7 @@ and which account still has room. Monitor one account or several, with a live
 dashboard or a single snapshot.
 
 ```text
-CODEX  live quota via account/rateLimits/read
+CODEX  live quota via usage API (cached up to 1m)
   personal   alex@example.com                 pro   █████░░░░░░░░░  34.0%  5h window
                                                     █████████░░░░░  62.0%  7d window
                                                     credits: none
@@ -29,7 +29,7 @@ credits when available, and stale-data or error status.
 - Codex and Claude Code, with named profiles for multiple accounts.
 - Live provider quotas, including weekly and model-specific windows.
 - Built-in refresh loop. Works from Bash, Zsh, Fish, and other shells; no `watch` command needed.
-- Python standard library only at runtime. Linux, macOS, and WSL; Python 3.10+.
+- Standalone binaries for Linux and macOS; also runs from source with Python 3.10+ on Linux, macOS, and WSL.
 - JSON output, email hiding, ASCII mode, and an offline demo.
 
 ## Try it
@@ -48,6 +48,38 @@ is optional. Subscription quotas require a ChatGPT or claude.ai login; API-key
 billing, Bedrock, and other third-party providers are outside this tool's scope.
 
 ## Install
+
+### Standalone binary
+
+Download the archive for your operating system and architecture from
+[GitHub Releases](https://github.com/fmorency/ai-watch/releases). No Python
+installation is needed. Archives are available for Linux and macOS, each on
+x86-64 and ARM64, with `SHA256SUMS` for verification.
+
+For example, on Linux x86-64:
+
+```sh
+tar -xzf ai-watch-v0.1.0-linux-x86_64.tar.gz
+cd ai-watch-v0.1.0-linux-x86_64
+./ai-watch --demo --once
+```
+
+The archive includes the executable, an `ai-usage` symlink for one-shot reports,
+`examples/config.json`, documentation, and license files. To install the commands
+on your PATH:
+
+```sh
+mkdir -p ~/.local/bin
+install -m 755 ai-watch ~/.local/bin/ai-watch
+ln -sf ai-watch ~/.local/bin/ai-usage
+```
+
+Ensure `~/.local/bin` is on your PATH. Use your normal provider logins and the
+account configuration described below. Linux binaries require glibc 2.35+;
+macOS builds target macOS 14+ on ARM64 and macOS 15+ on Intel and are not
+Apple-notarized. See [release documentation](docs/RELEASING.md) for build details.
+
+### Python package
 
 To make `ai-watch` and the one-shot `ai-usage` command available on your PATH:
 
@@ -93,9 +125,9 @@ override that choice. Usage percentages mean **used**, not remaining.
 Exit codes: `0` for a successful snapshot, `1` when any selected account is
 unavailable or stale (or no profiles exist), `2` for invalid configuration or
 arguments, and `130` for Ctrl+C. Live mode keeps refreshing through provider
-errors. `--timeout SECONDS` defaults to 20: it bounds each Codex probe and each
-Claude network operation. An in-flight Claude request can delay shutdown until
-its network timeout.
+errors. `--timeout SECONDS` defaults to 20 for provider network operations and
+cache-lock waits. An in-flight request can delay shutdown until its network
+timeout.
 
 ## Accounts and configuration
 
@@ -144,6 +176,16 @@ ai-watch --profile codex:work        # only the Codex work account
 ai-watch --profile personal --profile work
 ```
 
+### Codex credentials
+
+ai-watch reads the ChatGPT login from `<profile home>/auth.json`. It does not
+start Codex, use API-key environment variables, or write/refresh login tokens.
+Codex installations that store credentials only in an OS keyring are not
+supported by this reader. To use file storage, set
+`cli_auth_credentials_store = "file"` in that profile's Codex `config.toml`,
+then sign in again with `codex login` under the same `CODEX_HOME`. See
+[Codex authentication](https://learn.chatgpt.com/docs/auth#credential-storage).
+
 ### Claude on macOS
 
 Claude Code normally stores its login in the macOS Keychain. ai-watch reads
@@ -170,28 +212,31 @@ the quota still appears under its configured name.
 
 ## How it works
 
-Codex queries go through a short-lived `codex app-server` scoped to the selected
-`CODEX_HOME`. ai-watch initializes it, reads the account and rate limits, then
-closes it. Both primary and secondary quota windows are displayed, along with
-additional buckets. See the [Codex app-server protocol](https://learn.chatgpt.com/docs/app-server).
+Codex queries use a read-only `GET` to
+`https://chatgpt.com/backend-api/wham/usage`, with the selected profile's saved
+access token and account ID. The response must match that account. Both primary
+and secondary quota windows are displayed, along with additional buckets and
+credit status. This is the usage endpoint used by the
+[Codex backend client](https://github.com/openai/codex/blob/main/codex-rs/backend-client/src/client/rate_limit_resets.rs),
+not a stable public API.
 
 Claude queries use the profile's existing OAuth login to read
-`https://api.anthropic.com/api/oauth/usage`. This endpoint and the credential
-format are provider internals and may change. ai-watch understands both the
+`https://api.anthropic.com/api/oauth/usage`. Both providers' endpoints and
+credential formats are internal and may change. ai-watch understands both the
 structured `limits` response and older `five_hour` / `seven_day` fields. It does
 not infer subscription quotas from local conversation history.
 
-Claude results are cached for 120 seconds under
+Codex results are cached for 60 seconds and Claude results for 120 seconds under
 `${XDG_CACHE_HOME:-~/.cache}/ai-watch/`. The cache is locked across processes,
-separated by profile and login, and contains quota data rather than tokens.
+separated by profile and login, and contains quota data without tokens or emails.
 After errors, a previous result can remain visible for up to an hour, explicitly
 marked **STALE**. HTTP 429 responses honor `Retry-After`. A shorter dashboard
-refresh interval does not bypass the Claude cache.
+refresh interval does not bypass either provider's cache.
 
 ai-watch sends no prompts or model requests and has no telemetry. It reads
-existing logins; Codex itself owns its authentication lifecycle. ai-watch does
-not write credential files or refresh Claude tokens. If Claude rejects an
-expired login, open Claude Code for that profile to renew it. Account emails
+existing logins without starting either provider CLI. It does not write
+credential files or refresh tokens. If a login expires, renew it through
+`codex login` or Claude Code for the same profile. Account emails
 appear locally by default; use `--hide-email` or `--demo` when sharing your screen.
 JSON contains normalized quotas and optional emails, not credentials or raw API
 responses. Profile names remain visible with `--hide-email`.
@@ -201,14 +246,15 @@ responses. Profile names remain visible with `--hide-email`.
 | Symptom | What to check |
 | --- | --- |
 | No profiles found | Sign in with a provider or add its directory to the config. |
-| Codex cannot start | Ensure `codex` is on PATH in the shell running ai-watch. |
-| Codex rejects a read or times out | Verify that profile's login and network; update the CLI or increase `--timeout`. |
+| No Codex auth.json | Use a ChatGPT login with file-based Codex credential storage; see above. |
+| Codex login expired / HTTP 401 | Run `codex login` with the same `CODEX_HOME`. |
+| Codex HTTP 403 or timeout | Verify that profile's login and network; check for ai-watch updates or increase `--timeout`. |
 | Claude login expired / HTTP 401 | Open Claude Code for the same profile and renew its login. |
 | Claude HTTP 403 | The login may not have access to the usage endpoint. Sign in again through Claude Code. |
-| Claude HTTP 429 | Let the displayed retry delay expire; frequent restarts will not bypass it. |
+| HTTP 429 | Let the displayed retry delay expire; frequent restarts will not bypass it. |
 | Claude Keychain lookup fails | Unlock your Keychain and check the profile's `keychain_service`. |
 | Cache cannot be accessed | Make sure `XDG_CACHE_HOME` points to a directory you can write. |
-| Quotas look unchanged | Claude caches successful reads for two minutes; wait for the next fetch. |
+| Quotas look unchanged | Codex caches reads for one minute and Claude for two; wait for the next fetch. |
 
 Native Windows monitoring is not supported in this version; use WSL. macOS
 Keychain access requires a local user session with access to the saved login.
@@ -220,12 +266,13 @@ python3 -m unittest discover -s tests -v
 python3 -m ai_watch --demo --once
 ```
 
-Tests use synthetic credentials, a fake Codex process, and mocked HTTP responses.
+Tests use synthetic credentials and mocked HTTP responses.
 They make no provider requests. CI checks Python 3.10 and 3.14 on Linux and macOS,
 including package installation and the CLI entry points. Live provider access
-depends on your installed CLIs, subscription, and current provider behavior.
+depends on saved logins, subscription access, and current provider behavior.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance and
+[docs/RELEASING.md](docs/RELEASING.md) for building binaries and publishing releases.
 
 ## License
 

@@ -1,179 +1,168 @@
-"""Read account identity and limits from a short-lived Codex app-server."""
+"""Read Codex subscription quotas directly, without starting the Codex CLI."""
 
+import base64
 import json
-import os
-import selectors
-import subprocess
 import time
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, build_opener
 
-from . import __version__
-from .common import UsageError, number, optional_text, window
+from . import __version__, cache
+from .common import UsageError, number, optional_text, read_object, window
+from .http import MAX_RESPONSE, NoRedirect, retry_time
 
-
-class AppServer:
-    def __init__(self, home, timeout, cancel=None):
-        self.deadline = time.monotonic() + timeout
-        self.cancel = cancel
-        self.buffer = b""
-        self.counter = 0
-        env = dict(os.environ, CODEX_HOME=str(home))
-        # A parent agent's credentials must not override the selected profile.
-        for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_IDENTITY_TOKEN_FILE",
-                    "OPENAI_FEDERATION_RULE_ID"):
-            env.pop(key, None)
-        try:
-            self.proc = subprocess.Popen(
-                ["codex", "app-server"], env=env, cwd=home,
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, bufsize=0,
-            )
-        except OSError:
-            raise UsageError("cannot start codex; install the Codex CLI and check PATH") from None
-        self.selector = selectors.DefaultSelector()
-        self.selector.register(self.proc.stdout, selectors.EVENT_READ)
-
-    def send(self, message):
-        try:
-            self.proc.stdin.write((json.dumps(message) + "\n").encode())
-            self.proc.stdin.flush()
-        except OSError:
-            raise UsageError("Codex app-server closed its input") from None
-
-    def receive(self):
-        while True:
-            remaining = self.deadline - time.monotonic()
-            if remaining <= 0 or (self.cancel is not None and self.cancel.is_set()):
-                raise UsageError("Codex app-server timed out; check this profile's login and network")
-            if b"\n" in self.buffer:
-                line, self.buffer = self.buffer.split(b"\n", 1)
-                try:
-                    message = json.loads(line)
-                except (ValueError, UnicodeError):
-                    continue
-                if isinstance(message, dict):
-                    return message
-                continue
-            if not self.selector.select(min(remaining, 0.1)):
-                continue
-            chunk = os.read(self.proc.stdout.fileno(), 65536)
-            if not chunk:
-                raise UsageError("Codex app-server exited before returning usage")
-            self.buffer += chunk
-            if len(self.buffer) > 4 * 1024 * 1024:
-                raise UsageError("Codex app-server returned an oversized response")
-
-    def request(self, method, params):
-        self.counter += 1
-        request_id = self.counter
-        self.send({"id": request_id, "method": method, "params": params})
-        while True:
-            message = self.receive()
-            if "method" in message:
-                if "id" in message:
-                    self.send({"id": message["id"], "error": {
-                        "code": -32601, "message": "ai-watch does not handle server requests"}})
-                continue
-            if message.get("id") != request_id:
-                continue
-            if "error" in message:
-                raise UsageError(f"Codex rejected {method}; check login and update the Codex CLI")
-            result = message.get("result")
-            if not isinstance(result, dict):
-                raise UsageError("Codex app-server returned an invalid response")
-            return result
-
-    def close(self):
-        self.selector.close()
-        if self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-        self.proc.wait()
-        self.proc.stdin.close()
-        self.proc.stdout.close()
+USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+CACHE_TTL = 60
 
 
-def duration(minutes, fallback):
-    if not number(minutes) or not minutes:
+def credentials(profile):
+    try:
+        data = read_object(profile.home / "auth.json")
+    except FileNotFoundError:
+        raise UsageError("no Codex auth.json; sign in with file-based credential storage for this profile") from None
+    except (OSError, ValueError):
+        raise UsageError("could not read Codex credentials") from None
+    auth = data.get("tokens")
+    if (data.get("auth_mode") not in (None, "chatgpt")
+            or not isinstance(auth, dict) or data.get("OPENAI_API_KEY")):
+        raise UsageError("subscription quota requires a Codex ChatGPT login, not API billing")
+    for key in ("access_token", "account_id"):
+        value = auth.get(key)
+        if (not isinstance(value, str) or not value or not value.isascii()
+                or any(ord(c) <= 32 or ord(c) == 127 for c in value)):
+            raise UsageError("incomplete Codex login; run codex login for this profile")
+    # Refresh tokens are neither needed nor passed to the HTTP/cache layers.
+    return {key: auth.get(key) for key in ("access_token", "account_id", "id_token")}
+
+
+def identity(auth):
+    # Decode only for display; the server authenticates the access token. Keeping
+    # identity outside the quota cache avoids writing emails to another file.
+    try:
+        payload = auth["id_token"].split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        details = claims.get("https://api.openai.com/auth") or {}
+        return {"email": optional_text(claims.get("email")),
+                "plan": optional_text(details.get("chatgpt_plan_type"))}
+    except (KeyError, AttributeError, IndexError, TypeError, ValueError):
+        return {}
+
+
+def duration(seconds, fallback):
+    if not number(seconds) or not seconds:
         return fallback
-    if minutes % 1440 == 0:
-        return f"{minutes / 1440:g}d"
-    if minutes % 60 == 0:
-        return f"{minutes / 60:g}h"
-    return f"{minutes:g}m"
+    if seconds % 86400 == 0:
+        return f"{seconds / 86400:g}d"
+    if seconds % 3600 == 0:
+        return f"{seconds / 3600:g}h"
+    if seconds % 60 == 0:
+        return f"{seconds / 60:g}m"
+    return f"{seconds:g}s"
 
 
 def parse_limits(data):
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or "error" in data:
         raise UsageError("Codex returned invalid quota data")
-    main = data.get("rateLimits") or {}
-    buckets = data.get("rateLimitsByLimitId") or {}
-    if not isinstance(main, dict) or not isinstance(buckets, dict):
+    entries = [(None, data.get("rate_limit"))]
+    additional = data.get("additional_rate_limits")
+    if additional is not None and not isinstance(additional, list):
         raise UsageError("Codex returned invalid quota data")
-    entries = [(None, main)] if main else []
-    for key, limit in buckets.items():
-        if key != main.get("limitId") and limit != main:
-            entries.append((key, limit))
+    for entry in additional or []:
+        if not isinstance(entry, dict):
+            raise UsageError("Codex returned invalid quota data")
+        label = optional_text(entry.get("limit_name")) or optional_text(entry.get("metered_feature"))
+        entries.append((label, entry.get("rate_limit")))
     windows, notes = [], []
-    for key, limit in entries:
+    for label, limit in entries:
+        if limit is None:
+            continue
         if not isinstance(limit, dict):
             raise UsageError("Codex returned invalid quota data")
-        label = optional_text(limit.get("limitName")) or key
         prefix = f"{label}: " if label else ""
         for slot in ("primary", "secondary"):
-            quota = limit.get(slot)
+            quota = limit.get(slot + "_window")
             if quota is None:
                 continue
             if not isinstance(quota, dict):
                 raise UsageError("Codex returned invalid quota data")
-            name = prefix + duration(quota.get("windowDurationMins"), slot) + " window"
-            windows.append(window(name, quota.get("usedPercent"), quota.get("resetsAt")))
-        reached = optional_text(limit.get("rateLimitReachedType"))
-        if reached:
-            notes.append(prefix + "LIMIT REACHED: " + reached)
-        if limit.get("spendControlReached") is True:
-            notes.append(prefix + "spend control reached")
-        credits = limit.get("credits")
-        if isinstance(credits, dict):
-            if credits.get("unlimited") is True:
-                notes.append(prefix + "credits: unlimited")
-            elif credits.get("hasCredits") is True:
-                balance = optional_text(credits.get("balance")) or "available"
-                notes.append(prefix + "credits: " + balance)
-            elif credits.get("hasCredits") is False:
-                notes.append(prefix + "credits: none")
-    if data.get("ordinaryUsageAllowed") is False:
-        notes.append("ordinary included usage is currently unavailable")
+            name = prefix + duration(quota.get("limit_window_seconds"), slot) + " window"
+            windows.append(window(name, quota.get("used_percent"), quota.get("reset_at")))
+        if limit.get("allowed") is False:
+            notes.append(prefix + "ordinary included usage is currently unavailable")
+        elif limit.get("limit_reached") is True:
+            notes.append(prefix + "LIMIT REACHED")
+    reached = data.get("rate_limit_reached_type")
+    if isinstance(reached, dict) and optional_text(reached.get("type")):
+        notes.append("LIMIT REACHED: " + reached["type"])
+    spend = data.get("spend_control")
+    if isinstance(spend, dict) and spend.get("reached") is True:
+        notes.append("spend control reached")
+    credits = data.get("credits")
+    if isinstance(credits, dict):
+        if credits.get("unlimited") is True:
+            notes.append("credits: unlimited")
+        elif credits.get("has_credits") is True:
+            notes.append("credits: " + (optional_text(credits.get("balance")) or "available"))
+        elif credits.get("has_credits") is False:
+            notes.append("credits: none")
     if not windows and not notes:
         raise UsageError("Codex returned no quota data for this account")
-    return {"windows": windows, "notes": list(dict.fromkeys(notes))}
+    result = {"windows": windows, "notes": list(dict.fromkeys(notes))}
+    if optional_text(data.get("plan_type")):
+        result["plan"] = data["plan_type"]
+    return result
+
+
+def fetch_usage(auth, timeout):
+    request = Request(USAGE_URL, headers={
+        "Authorization": f"Bearer {auth['access_token']}",
+        "ChatGPT-Account-Id": auth["account_id"], "Accept": "application/json",
+        "User-Agent": f"ai-watch/{__version__}",
+    }, method="GET")
+    try:
+        with build_opener(NoRedirect()).open(request, timeout=timeout) as response:
+            body = response.read(MAX_RESPONSE + 1)
+        if len(body) > MAX_RESPONSE:
+            raise UsageError("Codex returned an oversized response")
+        data = json.loads(body)
+        if not isinstance(data, dict) or data.get("account_id") != auth["account_id"]:
+            raise UsageError("Codex usage account does not match this profile's login; sign in again")
+        return parse_limits(data)
+    except HTTPError as exc:
+        status = exc.code
+        retry = exc.headers.get("Retry-After") if exc.headers else None
+        exc.close()
+        if status == 429:
+            return {"error": "usage check rate limited (HTTP 429)",
+                    "retry_at": retry_time(retry, time.time())}
+        if status == 401:
+            return {"error": "Codex login expired or rejected; run codex login for this profile to renew it"}
+        if status == 403:
+            return {"error": "Codex denied usage access (HTTP 403); check this profile's login"}
+        return {"error": f"Codex usage API returned HTTP {status}"}
+    except UsageError as exc:
+        return {"error": str(exc)}
+    except (ValueError, UnicodeError):
+        return {"error": "Codex usage API returned invalid JSON"}
+    except (TimeoutError, URLError, OSError):
+        return {"error": "could not reach Codex usage API (network error or timeout)"}
+
+
+def cache_key(profile, auth):
+    return cache.key(profile, auth["access_token"], auth["account_id"])
+
+
+def cached_usage(profile, auth, timeout, cache_dir=None, cancel=None):
+    return cache.read_or_fetch(cache_key(profile, auth), lambda: fetch_usage(auth, timeout),
+                               timeout, CACHE_TTL, cache_dir, cancel)
 
 
 def fetch(profile, timeout=20, cancel=None):
-    if not profile.home.is_dir():
-        return {"error": "profile directory does not exist"}
-    server = None
-    identity = {}
+    details = {}
     try:
-        server = AppServer(profile.home, timeout, cancel)
-        server.request("initialize", {"clientInfo": {
-            "name": "ai-watch", "title": "ai-watch", "version": __version__}})
-        server.send({"method": "initialized", "params": {}})
-        account = server.request("account/read", {"refreshToken": False}).get("account")
-        if not isinstance(account, dict):
-            raise UsageError("not logged in; run codex login for this profile")
-        if account.get("type") != "chatgpt":
-            raise UsageError("subscription quota requires a ChatGPT login, not API billing")
-        identity = {"email": optional_text(account.get("email")),
-                    "plan": optional_text(account.get("planType"))}
-        result = parse_limits(server.request("account/rateLimits/read", {}))
-        return dict(identity, **result, fetched_at=time.time())
+        auth = credentials(profile)
+        details = identity(auth)
+        return dict(details, **cached_usage(profile, auth, timeout, cancel=cancel))
     except UsageError as exc:
-        return dict(identity, error=str(exc))
+        return dict(details, error=str(exc))
     except OSError:
-        return dict(identity, error="could not communicate with Codex app-server")
-    finally:
-        if server is not None:
-            server.close()
+        return dict(details, error="could not access the usage cache; check XDG_CACHE_HOME permissions")
