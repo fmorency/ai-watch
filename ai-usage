@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+from ai_watch.cli import usage_main
+
+raise SystemExit(usage_main())

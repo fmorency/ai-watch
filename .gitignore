@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.DS_Store
+.env
+.env.*
+config.json
+!examples/config.json
+auth.json
+.credentials.json
+.claude.json
+.cache/
+.coverage
+htmlcov/

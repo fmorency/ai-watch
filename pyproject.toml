@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-watch"
+version = "0.1.0"
+description = "A terminal dashboard for Codex and Claude Code subscription usage"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Félix C. Morency"}]
+dependencies = []
+classifiers = [
+  "Environment :: Console",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Homepage = "https://github.com/fmorency/ai-watch"
+Issues = "https://github.com/fmorency/ai-watch/issues"
+
+[project.scripts]
+ai-watch = "ai_watch.cli:main"
+ai-usage = "ai_watch.cli:usage_main"
+
+[tool.setuptools]
+packages = ["ai_watch"]

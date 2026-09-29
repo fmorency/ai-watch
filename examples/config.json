@@ -1,0 +1,8 @@
+{
+  "profiles": [
+    {"provider": "codex", "name": "personal", "home": "~/.codex"},
+    {"provider": "codex", "name": "work", "home": "~/.codex-work"},
+    {"provider": "claude", "name": "personal", "home": "~/.claude"},
+    {"provider": "claude", "name": "work", "home": "~/.claude-work"}
+  ]
+}
